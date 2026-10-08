@@ -1,0 +1,430 @@
+import tree_sitter_cpp as tscpp
+from tree_sitter import Language, Parser
+import os
+import torch
+from torch_geometric.data import HeteroData
+from transformers import RobertaModel, RobertaTokenizer
+import tree_sitter
+from typing import Dict, List, Tuple
+import argparse
+
+# ================ 1. 异构图元数据定义 =================
+
+def get_model_metadata():
+    """
+    通过笛卡尔积动态生成全量元数据，杜绝 KeyError。
+    """
+    node_types = ['structure', 'statement', 'expression', 'variable', 'other_node']
+    rel_types = ['ast', 'cfg', 'dfg']
+
+    edge_types = []
+    for src in node_types:
+        for rel in rel_types:
+            for dst in node_types:
+                edge_types.append((src, rel, dst))
+
+    for n in node_types:
+        edge_types.append((n, 'self_loop', n))
+
+    return node_types, edge_types
+
+
+# ================= 2. 异构图节点分类逻辑 (C++ 适配版) =================
+
+def get_node_category(node_type: str) -> str:
+    """
+    针对 C++ 语法节点进行优化映射。
+    """
+    # 结构/定义类
+    structures = {
+        'translation_unit', 'class_specifier', 'struct_specifier', 'enum_specifier',
+        'namespace_definition', 'function_definition', 'declaration', 'parameter_list',
+        'parameter_declaration', 'template_declaration', 'linkage_specification'
+    }
+
+    # 语句类
+    statements = {
+        'if_statement', 'for_statement', 'while_statement', 'do_statement',
+        'switch_statement', 'case_statement', 'try_statement', 'catch_clause',
+        'return_statement', 'break_statement', 'continue_statement', 'throw_statement',
+        'expression_statement', 'compound_statement', 'labeled_statement', 'co_return_statement'
+    }
+
+    # 表达式/字面量类
+    expressions = {
+        'assignment_expression', 'binary_expression', 'call_expression',
+        'field_expression', 'subscript_expression', 'parenthesized_expression',
+        'cast_expression', 'lambda_expression', 'conditional_expression',
+        'unary_expression', 'update_expression', 'pointer_expression',
+        'string_literal', 'number_literal', 'true', 'false', 'null', 'char_literal'
+    }
+
+    if node_type in ['identifier', 'field_identifier', 'namespace_identifier']:
+        return 'variable'
+    elif node_type in structures:
+        return 'structure'
+    elif node_type in statements:
+        return 'statement'
+    elif node_type in expressions:
+        return 'expression'
+    else:
+        return 'other_node'
+
+
+# ================= 3. Tree-sitter 基础解析 (C++ 适配版) =================
+
+def initialize_tree_sitter():
+    CPP_LANGUAGE = Language(tscpp.language())
+    parser = Parser(CPP_LANGUAGE)
+    return parser
+
+
+def build_node_map(code: str, parser: Parser) -> Tuple[tree_sitter.Node, Dict]:
+    code_bytes = bytes(code, 'utf8', errors='replace')
+    tree = parser.parse(code_bytes)
+    root_node = tree.root_node
+    node_map = {}
+    code_lines = code.split('\n')
+
+    def traverse(node, node_id=0):
+        if node.is_named:
+            node_map[node_id] = {
+                'id': node_id,
+                'type': node.type,
+                'start_point': node.start_point,
+                'end_point': node.end_point,
+                'start_byte': node.start_byte,
+                'end_byte': node.end_byte,
+                'text': extract_node_text(node, code_lines),
+                'children': []
+            }
+            children_ids = []
+            next_id = node_id + 1
+            for child in node.children:
+                if child.is_named:
+                    child_id = next_id
+                    next_id, _ = traverse(child, next_id)
+                    children_ids.append(child_id)
+            node_map[node_id]['children'] = children_ids
+            return next_id, node_id
+        return node_id, None
+
+    _, root_id = traverse(root_node)
+    return root_node, node_map
+
+
+def extract_node_text(node, code_lines):
+    start_point = node.start_point
+    end_point = node.end_point
+    try:
+        if start_point[0] == end_point[0]:
+            return code_lines[start_point[0]][start_point[1]:end_point[1]]
+        else:
+            lines = [code_lines[start_point[0]][start_point[1]:]]
+            for i in range(start_point[0] + 1, end_point[0]):
+                lines.append(code_lines[i])
+            lines.append(code_lines[end_point[0]][:end_point[1]])
+            return "\n".join(lines)
+    except IndexError:
+        return ""
+
+
+def refine_node_text(node_map: Dict) -> Dict:
+    # 针对 C++ 各种大括号快或复杂定义提取首行
+    statement_types = [
+        'if_statement', 'for_statement', 'while_statement', 'do_statement', 
+        'try_statement', 'catch_clause', 'function_definition', 'class_specifier', 
+        'struct_specifier', 'compound_statement'
+    ]
+    for node_id, info in node_map.items():
+        original_text = info['text']
+        if info['type'] in statement_types:
+            info['refined_text'] = original_text.split('{')[0].strip() if '{' in original_text else original_text.split('\n')[0].strip()
+        else:
+            info['refined_text'] = original_text[:512] if len(original_text) > 512 else original_text
+    return node_map
+
+
+# ================= 4. 边构建逻辑 (CFG, DFG, AST - C++ 适配版) =================
+
+def build_cfg(node_map: Dict) -> List[Tuple[int, int, str, str]]:
+    cfg_edges = []
+    
+    # 1. 复合语句内顺序执行（C++ 的 {} 块对应的是 compound_statement）
+    for node_id, info in node_map.items():
+        if info['type'] == 'compound_statement':
+            for i in range(len(info['children']) - 1):
+                cfg_edges.append((info['children'][i], info['children'][i + 1], 'CFG', 'sequential'))
+
+    # 2. 控制流分支控制
+    for node_id, info in node_map.items():
+        if info['type'] == 'if_statement':
+            for child_id in info['children']:
+                c_info = node_map[child_id]
+                if c_info['type'] == 'compound_statement':
+                    cfg_edges.append((node_id, child_id, 'CFG', 'true_branch'))
+                elif c_info['type'] in ['if_statement', 'compound_statement'] and child_id == info['children'][-1]:
+                    cfg_edges.append((node_id, child_id, 'CFG', 'false_branch'))
+
+        elif info['type'] in ['for_statement', 'while_statement']:
+            for child_id in info['children']:
+                if node_map[child_id]['type'] == 'compound_statement':
+                    cfg_edges.append((node_id, child_id, 'CFG', 'loop_body'))
+                    if node_map[child_id]['children']:
+                        cfg_edges.append((node_map[child_id]['children'][-1], node_id, 'CFG', 'loop_back'))
+
+        elif info['type'] == 'try_statement':
+            for child_id in info['children']:
+                c_type = node_map[child_id]['type']
+                if c_type == 'compound_statement':
+                    cfg_edges.append((node_id, child_id, 'CFG', 'try_block'))
+                elif c_type == 'catch_clause':
+                    cfg_edges.append((node_id, child_id, 'CFG', 'exception_handler'))
+
+    return cfg_edges
+
+
+def find_identifier_node(node_id, node_map):
+    """
+    递归寻找指定节点下的标识符叶子节点，
+    用于穿透 C++ 特有的 pointer_declarator, reference_declarator 等声明包裹层。
+    """
+    info = node_map[node_id]
+    if info['type'] in ['identifier', 'field_identifier', 'namespace_identifier']:
+        return node_id
+    
+    # 深度优先搜索子节点
+    for child_id in info['children']:
+        res = find_identifier_node(child_id, node_map)
+        if res is not None:
+            return res
+    return None
+
+
+def build_dfg(node_map: Dict) -> List[Tuple[int, int, str, str]]:
+    """
+    针对 C++ 语法树优化后的数据流图（DFG）构建逻辑。
+    支持复杂变量定义（带指针、引用、模板等修饰符）的依赖流提取。
+    """
+    dfg_edges = []
+
+    def process_node(node_id, states):
+        info = node_map[node_id]
+        local_dfg = []
+
+        # 1. 变量被读取/引用的场景
+        if info['type'] in ['identifier', 'field_identifier']:
+            var_name = info['text']
+            if var_name in states:
+                for def_id in states[var_name]:
+                    if def_id != node_id:
+                        local_dfg.append((def_id, node_id, 'DFG', 'data_flow'))
+
+        # 2. C++ 标准赋值表达式：a = b;
+        elif info['type'] == 'assignment_expression':
+            left_id, right_id = None, None
+            for child_id in info['children']:
+                c_type = node_map[child_id]['type']
+                if c_type in ['identifier', 'field_expression', 'pointer_expression', 'subscript_expression']:
+                    # 递归穿透可能存在的复杂指针或数组索引操作，定位核心变量标识符
+                    left_id = find_identifier_node(child_id, node_map)
+                elif c_type not in ['=', '+=', '-=', '*=', '/=']:
+                    right_id = child_id
+
+            if left_id and right_id:
+                local_dfg.append((right_id, left_id, 'DFG', 'assignment'))
+                if node_map[left_id]['type'] == 'identifier':
+                    var_name = node_map[left_id]['text']
+                    states[var_name] = [left_id]
+
+        # 3. C++ 变量定义且带有初始化的场景：int a = 10;
+        # 在 tree-sitter-cpp 中通常表现为 init_declarator 节点
+        elif info['type'] == 'init_declarator':
+            left_id, right_id = None, None
+            if len(info['children']) >= 2:
+                # 核心修复：通过递归查找器穿透指针（*）、引用（&）等声明节点，抓取真正的变量标识符
+                left_id = find_identifier_node(info['children'][0], node_map)
+                right_id = info['children'][-1]  # 赋值符号右侧的初始化值部分
+            
+            if left_id and right_id:
+                local_dfg.append((right_id, left_id, 'DFG', 'init_assignment'))
+                if node_map[left_id]['type'] in ['identifier', 'field_identifier']:
+                    var_name = node_map[left_id]['text']
+                    states[var_name] = [left_id]
+
+        # 递归处理子节点，保持当前变量的状态定义域 states 正常传递
+        for child_id in info['children']:
+            sub_dfg, _ = process_node(child_id, states)
+            local_dfg.extend(sub_dfg)
+            
+        return local_dfg, states
+
+    # 针对 C++ 全局顶层文件（translation_unit）启动 DFG 解析
+    for root_id, info in node_map.items():
+        if info['type'] == 'translation_unit':
+            edges, _ = process_node(root_id, {})
+            dfg_edges.extend(edges)
+            
+    return list(set(dfg_edges))
+
+
+def extract_ast_edges(node_map: Dict) -> List[Tuple[int, int, str, str]]:
+    ast_edges = []
+    for node_id, info in node_map.items():
+        for child_id in info['children']:
+            ast_edges.append((node_id, child_id, 'AST', 'child_of'))
+    return ast_edges
+
+
+# ================= 5. 编码与嵌入 =================
+
+def initialize_encoder(model_name_or_path: str, device: str):
+    tokenizer = RobertaTokenizer.from_pretrained(model_name_or_path)
+    model = RobertaModel.from_pretrained(model_name_or_path).to(device)
+    model.eval()
+    return tokenizer, model
+
+
+def encode_nodes(node_map: Dict, tokenizer, model, batch_size=64) -> torch.Tensor:
+    device = next(model.parameters()).device
+    node_ids = sorted(node_map.keys())
+    texts = [node_map[nid].get('refined_text', '') for nid in node_ids]
+
+    all_embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        batch = [t if (t and t.strip()) else "empty" for t in batch]
+        inputs = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, max_length=128).to(device)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            batch_embs = outputs.last_hidden_state[:, 0, :].detach().cpu().half()
+            all_embeddings.append(batch_embs)
+
+    return torch.cat(all_embeddings, dim=0).float() if all_embeddings else torch.zeros((0, 768))
+
+
+def encode_edges(all_edges: List, tokenizer, model, batch_size=128, edge_cache_path=None) -> torch.Tensor:
+    if not all_edges: return torch.zeros((0, 768))
+
+    if edge_cache_path and os.path.exists(edge_cache_path):
+        try:
+            cache = torch.load(edge_cache_path, weights_only=False)
+            edge_embs = [cache.get(attr, torch.zeros(768)) for _, _, _, attr in all_edges]
+            return torch.stack(edge_embs)
+        except:
+            pass
+
+    device = next(model.parameters()).device
+    texts = [attr for _, _, _, attr in all_edges]
+    all_embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        inputs = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, max_length=64).to(device)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            all_embeddings.append(outputs.last_hidden_state[:, 0, :].detach().cpu().half())
+
+    return torch.cat(all_embeddings, dim=0).float()
+
+# ================= 6. 异构图组装 =================
+
+def build_pyg_hetero_graph(node_map: Dict, all_edges: List, node_embeddings: torch.Tensor,
+                           edge_embeddings: torch.Tensor) -> HeteroData:
+    data = HeteroData()
+    node_ids = sorted(node_map.keys())
+
+    global_to_local = {}
+    cat_to_global_indices = {}
+    cat_counts = {}
+
+    for i, nid in enumerate(node_ids):
+        cat = get_node_category(node_map[nid]['type'])
+        if cat not in cat_counts:
+            cat_counts[cat] = 0
+            cat_to_global_indices[cat] = []
+        global_to_local[nid] = (cat, cat_counts[cat])
+        cat_to_global_indices[cat].append(i)
+        cat_counts[cat] += 1
+
+    for cat, indices in cat_to_global_indices.items():
+        data[cat].x = node_embeddings[indices]
+        positions = []
+        for idx in indices:
+            nid = node_ids[idx]
+            positions.append([node_map[nid]['start_byte'], node_map[nid]['end_byte']])
+        data[cat].node_positions = torch.tensor(positions, dtype=torch.long)
+
+    for i, (src_id, dst_id, rel_label, _) in enumerate(all_edges):
+        if src_id not in global_to_local or dst_id not in global_to_local: continue
+        src_cat, src_idx = global_to_local[src_id]
+        dst_cat, dst_idx = global_to_local[dst_id]
+        edge_key = (src_cat, rel_label.lower(), dst_cat)
+
+        if not hasattr(data[edge_key], 'edge_index'):
+            data[edge_key].edge_index = torch.empty((2, 0), dtype=torch.long)
+            data[edge_key].edge_attr = torch.empty((0, edge_embeddings.size(1)), dtype=torch.float)
+
+        new_edge = torch.tensor([[src_idx], [dst_idx]], dtype=torch.long)
+        data[edge_key].edge_index = torch.cat([data[edge_key].edge_index, new_edge], dim=1)
+        data[edge_key].edge_attr = torch.cat([data[edge_key].edge_attr, edge_embeddings[i].unsqueeze(0)], dim=0)
+
+    return data
+
+
+def code_to_graph(code: str, tokenizer, model, edge_types=['AST', 'CFG', 'DFG'], code_from_file=False,
+                  batch_size=256, edge_cache_path=None, **kwargs) -> HeteroData:
+    if code_from_file:
+        with open(code, 'r', encoding='utf-8', errors='replace') as f:
+            code = f.read()
+
+    parser = initialize_tree_sitter()
+    _, node_map = build_node_map(code, parser)
+    if not node_map:
+        return HeteroData()
+
+    node_map = refine_node_text(node_map)
+    node_map = dict(sorted(node_map.items()))
+
+    all_edges = []
+    e_types = [t.upper() for t in edge_types]
+    if 'CFG' in e_types: all_edges.extend(build_cfg(node_map))
+    if 'DFG' in e_types: all_edges.extend(build_dfg(node_map))
+    if 'AST' in e_types: all_edges.extend(extract_ast_edges(node_map))
+
+    node_embeddings = encode_nodes(node_map, tokenizer, model, batch_size=batch_size)
+    edge_embeddings = encode_edges(all_edges, tokenizer, model, batch_size=batch_size, edge_cache_path=edge_cache_path)
+
+    return build_pyg_hetero_graph(node_map, all_edges, node_embeddings, edge_embeddings)
+
+
+def save_graph(graph: HeteroData, output_path: str, edge_types: List[str]):
+    node_types, model_edge_types = get_model_metadata()
+    torch.save({
+        'graphs': [graph],
+        'metadata': (node_types, model_edge_types),
+        'edge_label_to_name': {i: t.upper() for i, t in enumerate(edge_types)}
+    }, output_path)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='C++ Code to Hetero-Graph Converter')
+    parser.add_argument('--file_path', type=str, default='Example.cpp')
+    parser.add_argument('--output', type=str, default='example_graph.pt')
+    parser.add_argument('--model_name_or_path', type=str, default='/root/autodl-tmp/unixcoder-base')
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--edge_cache_path', type=str, default=None)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    tokenizer, model = initialize_encoder(args.model_name_or_path, args.device)
+    if not os.path.exists(args.file_path):
+        with open(args.file_path, 'w') as f:
+            f.write("int add(int a, int b) {\n    int result = a + b;\n    return result;\n}")
+    target_edges = ['AST', 'CFG', 'DFG']
+    graph = code_to_graph(args.file_path, tokenizer, model, edge_types=target_edges,
+                          code_from_file=True, batch_size=args.batch_size, edge_cache_path=args.edge_cache_path)
+    save_graph(graph, args.output, target_edges)
+    print("C++ Graph Construction Completed.")

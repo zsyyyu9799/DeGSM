@@ -1,0 +1,96 @@
+language: "Cpp"
+tgt_language: "Rust"
+task: "translation"
+
+output:
+  save_dir: "/root/autodl-tmp/first_paper/output/cpp/third_stage/Rust_inference_results"
+  # 新增：推理结果具体保存的 CSV 路径
+  inference_csv: "/root/autodl-tmp/first_paper/cpp/translation_dataset/Rust_inference_results_original.csv"
+  log_freq: 10
+  multilang_evaluation_report: "/root/autodl-tmp/first_paper/human_stage3_llm/llama_evaluation_reports/human_cpp_to_rust_evaluation.csv" #最后评估生成的数据human或mbpp
+
+data:
+  # 统一输入路径
+  # test_path: "/root/autodl-tmp/first_paper/cpp/translation_dataset/nl_code_stage3_cleaned.jsonl" #第一次评估用这个
+  batch_size: 1
+  num_workers: 2
+  test_path: "/root/autodl-tmp/first_paper/human_stage3_llm/cpp/rust/new_human_cpp_vs_rust.jsonl" #最后的评估用这个数据
+  
+traindata:
+  batch_size: 4
+  num_workers: 2
+
+trainer:
+  lr: 2e-5              # 💡 将基准学习率从 5e-5 压低到 2e-5（步子迈小点）
+  weight_decay: 0.05    # 💡 确保该参数存在，并传递给 AdamW
+  num_epochs: 100
+
+finetune:
+  lr: 0.000005
+  weight_decay: 0.05
+  num_epochs: 200
+  batch_size: 2
+  num_workers: 2
+  finetune_model: "/root/autodl-tmp/first_paper/output/cpp/third_stage/Rust_inference_results/finetune_llama_model.pt"
+
+model:
+  embed_dim: 256
+  graph_width: 768
+  bert_model_dir: "microsoft/graphcodebert-base"
+  stage3_model_dir: "/root/autodl-tmp/first_paper/output/cpp/third_stage/Rust_inference_results/best_stage3_model.pt"
+  # stage2_model_dir: "/root/autodl-tmp/first_paper/output/cpp/second_stage/best_innovative_model.pt"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/starcoder"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/deepseek"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/qwen"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/llamabase"
+  llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/llama"
+  llm_type: "llama"
+  llm_dtype: "bfloat16"
+  max_txt_len: 1024
+  num_query_token: 32
+  query_groups: [10, 10, 10, 2]
+
+  use_api_mode: False
+
+generation:
+  max_new_tokens: 1024  # 保持不变，确保长函数不会被截断
+  min_new_tokens: 50
+  temperature: 0.9      # 初始生成保持低温度（更稳定）
+  top_p: 0.95
+  repetition_penalty: 1.05 # 适中的惩罚，防止模型陷入死循环
+  use_graph_info: True  # 确保图增强模式开启  False
+
+  # 新增/建议明确的参数
+  do_sample: True       # 必须为 True，否则修复时的随机性不足
+  num_candidates: 5 #生成的候选
+
+prompts:
+  translation:
+    system_prompt: |
+      You are an expert Rust software engineer strictly translating C++ into Rust. 
+      CRITICAL RULES:
+      1. **Output Purity**: ONLY output the translated Rust function inside a ```rust block. DO NOT write `fn main()`, DO NOT write test cases, and DO NOT provide any natural language explanations.
+      2. **Strict Rust Syntax**: NEVER use C++ style if-statements (e.g., `if (cond) return;`). You MUST use Rust brackets: `if cond { return; }`.
+      3. **String Handling**: Remember you cannot directly add two `String` types or a `&str` to a `String` without borrowing. Use `.push_str()` or `format!()`.
+      4. **Memory Safety**: Adhere strictly to Rust's ownership. Convert `std::vector` to `Vec<T>`, and use `Option<T>` for nulls.
+      
+    user_prompt: |
+      ### Cross-Modal Representation Analysis
+      The following graph-based features have been extracted from the cpp source code:
+      - **Structural Topology (AST)**: {struct_tokens}
+      - **Logical Control Flow (CFG)**: {logic_tokens}
+      - **Semantic Context**: {semantic_tokens}
+      
+      ### Global Synthesis Guidance
+      - **Global Navigation Anchor**: {global_tokens}
+      
+      ### Natural Language Intent
+      {nl_description}
+      
+      ### cpp Source Code
+      ```cpp
+      {cpp_code} 
+      ```
+      
+      ### Task
+      Please translate the provided C++ code into a production-ready, syntax-valid Rust implementation based on the structural, logical, and semantic features analyzed above:

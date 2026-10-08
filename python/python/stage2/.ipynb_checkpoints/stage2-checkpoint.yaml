@@ -1,0 +1,42 @@
+output:
+  save_dir: "/root/autodl-tmp/first_paper/output/python/second_stage"
+  checkpoint_interval: 1
+
+data:
+  input_path: "/root/autodl-tmp/first_paper/graph_dataset/python/stage2_dataset"
+  batch_size: 6         # 建议在显存允许的情况下保持 8-16，以增强 ITC 负样本质量
+  max_length: 512
+  num_workers: 4        # 建议改为 4，利用多核 CPU 加速数据分片加载
+  pin_memory: True
+    
+model:
+  bert_model_dir: "microsoft/graphcodebert-base"
+  num_query_token: 32
+  # 创新配置：查询组划分 [结构组, 逻辑组, 语义组]
+  query_groups: [10, 10, 10]
+  graph_width: 768
+  embed_dim: 256
+  device: "cuda"
+
+trainer:
+  lr: 5e-6              # 保持稳定学习率
+  weight_decay: 0.05
+  num_epochs: 400
+  patience: 10
+  warmup_steps: 100     # 增加Warmup，给解耦任务留出启动时间
+  log_freq: 50
+  accumulation_steps: 8 # 新增：通过梯度累积实现等效 128 的大 Batch，稳定 ITC
+  output_dir: "/root/autodl-tmp/first_paper/output/python/second_stage/语义引导实验"
+  val_interval: 2
+
+  # 损失权重 (Lambdas) - 核心微调区域
+  lambdas:
+    itc: 1.0            # 基础对齐，保持1.0作为基准
+    gtg: 1.2            # 提高：确保生成的代码符合语法规范
+    itm: 1.2
+    ortho: 0.5
+    
+  objectives:
+    enable_itc: True
+    enable_gtg: True
+    enable_itm: True

@@ -1,0 +1,98 @@
+# CGBridge Stage 3: 推理配置 (C to Rust 代码生成)
+language: "Python"
+tgt_language: "Ocaml"
+task: "translation"
+
+output:
+  save_dir: "/root/autodl-tmp/first_paper/output/python/third_stage/Ocaml_inference_results"
+  # 新增：推理结果具体保存的 CSV 路径
+  inference_csv: "/root/autodl-tmp/first_paper/python/translation_dataset/Ocaml_inference_results_original.csv"
+  log_freq: 10
+  multilang_evaluation_report: "/root/autodl-tmp/first_paper/human_stage3_llm/starcoder_evaluation_reports/human_py_to_ocaml_evaluation.csv" #最后评估生成的数据human或mbpp
+
+data:
+  # 统一输入路径
+  # test_path: "/root/autodl-tmp/first_paper/python/translation_dataset/nl_code_stage3_compiled_clean.jsonl" #第一次推理用这个
+  batch_size: 2
+  num_workers: 2
+  test_path: "/root/autodl-tmp/first_paper/human_stage3_llm/python/ocaml/new_human_python_vs_ocaml.jsonl" #最后的评估用这个数据
+  
+traindata:
+  batch_size: 4
+  num_workers: 2
+
+trainer:
+  lr: 2e-5              # 💡 将基准学习率从 5e-5 压低到 2e-5（步子迈小点）
+  weight_decay: 0.05    # 💡 确保该参数存在，并传递给 AdamW
+  num_epochs: 100
+
+finetune:
+  lr: 0.00001
+  weight_decay: 0.05
+  num_epochs: 200
+  batch_size: 3
+  num_workers: 2
+  finetune_model: "/root/autodl-tmp/first_paper/output/python/third_stage/Ocaml_inference_results/finetune_starcoder_model.pt"
+
+model:
+  embed_dim: 256
+  graph_width: 768
+  bert_model_dir: "microsoft/graphcodebert-base"
+  stage3_model_dir: "/root/autodl-tmp/first_paper/output/python/third_stage/Ocaml_inference_results/best_stage3_model.pt"
+  stage2_model_dir: "/root/autodl-tmp/first_paper/output/python/second_stage/best_innovative_model.pt"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/Deepseek"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/Qwen"
+  llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/starcoder"
+  llm_type: "starcoder"
+  llm_dtype: "bfloat16"
+  max_txt_len: 1024
+  num_query_token: 32
+  query_groups: [10, 10, 10, 2]
+
+  use_api_mode: False
+
+generation:
+  max_new_tokens: 1024  # 保持不变，确保长函数不会被截断
+  min_new_tokens: 50
+  temperature: 0.9      # 初始生成保持低温度（更稳定）
+  top_p: 0.95
+  repetition_penalty: 1.05 # 适中的惩罚，防止模型陷入死循环
+  use_graph_info: True  # 确保图增强模式开启  False
+
+  # 新增/建议明确的参数
+  do_sample: True       # 必须为 True，否则修复时的随机性不足
+  num_candidates: 5 #生成的候选
+
+prompts:
+  translation:
+    # 系统提示词：定义模型角色，并明确图特征（Graph Embedding）的主导地位
+    system_prompt: |
+      You are an expert OCaml software engineer specializing in rewriting Python code into highly optimized, idiomatic, and type-safe OCaml code.
+      
+      Translation Guidelines:
+      1. **Type Operators**: No implicit coercion. Use `+`, `-`, `*`, `/` for `int`, and `+.`, `-.`, `*.`, `/.` for `float` (e.g., `x +. 1.0`).
+      2. **Paradigm Shift**: Avoid mutable loops. Use functional paradigms: `let rec` for tail-recursion, or `List.map`/`List.fold_left`.
+      3. **Pattern Matching**: Replace Python `if-else` and `None` checks with exhaustive `match ... with` and `Option` types (`Some`/`None`).
+      4. **Syntax Restrictions**: Lowercase booleans (`true`/`false`). Separate expressions with `;`. Only use `(* ... *)` for comments (NO `#` or `//`).
+      5. **Output**: Return ONLY the executable OCaml code wrapped in an ```ocaml ... ``` block. No explanations.
+      
+    user_prompt: |
+      ### Cross-Modal Representation Analysis
+      The following graph-based features have been extracted from the Python source code:
+      - **Structural Topology (AST)**: {struct_tokens}
+      - **Logical Control Flow (CFG)**: {logic_tokens}
+      - **Semantic Context**: {semantic_tokens}
+
+      ### Global Synthesis Guidance
+      - **Global Navigation Anchor**: {global_tokens}
+      
+      ### Natural Language Intent
+      {nl_description}
+      
+      ### Python Source Code
+      ```python
+      {python_code} 
+      ```
+      
+      ### Task
+      Please translate the provided Python code into a production-ready, syntax-valid OCaml implementation based on the analysis above:

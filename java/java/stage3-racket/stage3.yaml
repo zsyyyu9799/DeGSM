@@ -1,0 +1,95 @@
+language: "Java"
+tgt_language: "Racket"
+task: "translation"
+
+output:
+  save_dir: "/root/autodl-tmp/first_paper/output/java/third_stage/Racket_inference_results"
+  # 新增：推理结果具体保存的 CSV 路径
+  inference_csv: "/root/autodl-tmp/first_paper/java/translation_dataset/Racket_inference_results_original.csv"
+  log_freq: 10
+  multilang_evaluation_report: "/root/autodl-tmp/first_paper/human_stage3_llm/llama_evaluation_reports/human_java_to_racket_evaluation.csv" #最后评估生成的数据human或mbpp
+
+data:
+  # 统一输入路径
+  # test_path: "/root/autodl-tmp/first_paper/java/translation_dataset/nl_code_stage3_compiled_clean.jsonl" #第一次推理用这个
+  batch_size: 1
+  num_workers: 2
+  test_path: "/root/autodl-tmp/first_paper/human_stage3_llm/java/racket/new_human_java_vs_racket.jsonl" #最后的评估用这个数据
+  
+traindata:
+  batch_size: 4
+  num_workers: 2
+
+trainer:
+  lr: 2e-5              # 💡 将基准学习率从 5e-5 压低到 2e-5（步子迈小点）
+  weight_decay: 0.05    # 💡 确保该参数存在，并传递给 AdamW
+  num_epochs: 100
+
+finetune:
+  lr: 0.00001
+  weight_decay: 0.05
+  num_epochs: 200
+  batch_size: 2
+  num_workers: 2
+  finetune_model: "/root/autodl-tmp/first_paper/output/java/third_stage/Racket_inference_results/finetune_llama_model.pt"
+
+model:
+  embed_dim: 256
+  graph_width: 768
+  bert_model_dir: "microsoft/graphcodebert-base"
+  stage3_model_dir: "/root/autodl-tmp/first_paper/output/java/third_stage/Racket_inference_results/best_stage3_model.pt"
+  stage2_model_dir: "/root/autodl-tmp/first_paper/output/java/second_stage/best_innovative_model.pt"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/Qwen"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/Deepseek"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/starcoder"
+  llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/llama"
+  llm_type: "llama"
+  llm_dtype: "bfloat16"
+  max_txt_len: 1024
+  num_query_token: 32
+  query_groups: [10, 10, 10, 2]
+
+  use_api_mode: False
+
+generation:
+  max_new_tokens: 768  # 保持不变，确保长函数不会被截断
+  min_new_tokens: 50
+  temperature: 0.9      # 初始生成保持低温度（更稳定）
+  top_p: 0.95
+  repetition_penalty: 1.05 # 适中的惩罚，防止模型陷入死循环
+  use_graph_info: True  # 确保图增强模式开启  False
+
+  # 新增/建议明确的参数
+  do_sample: True       # 必须为 True，否则修复时的随机性不足
+  num_candidates: 5 #生成的候选
+
+prompts:
+  translation:
+    system_prompt: |
+      You are an expert compiler engineer specializing in translating Java code into syntax-valid, clean, and functional Racket code.
+      
+      [Strict Rules]
+      1. Header Command: The very first line of your output MUST be `#lang racket`.
+      2. Pure Functional Style: Eliminate all imperative loops, mutable statuses, and variable assignments. Use functional iterations like `for/list`, `for/fold`, or recursion. Strict ban on `set!`, `hash-set!`, or boxes.
+      3. Syntax Purity: Use absolute parenthesization (S-expression). No leakage of C-style syntax (no curly braces `{}`, semicolons `;`, or commas `,`). Use Lisp-case (hyphenated) for identifier names.
+      4. Output Restraint: Return ONLY executable Racket code wrapped inside a single ```racket ... ``` block. No explanations, no introductory text.
+
+    user_prompt: |
+      ### Cross-Modal Representation Analysis
+      The following graph-based features have been extracted from the java source code:
+      - **Structural Topology Information (AST)**: {struct_tokens}
+      - **Logical Control Flow Information (CFG)**: {logic_tokens}
+      - **Code Semantic Context Features**: {semantic_tokens}
+
+      ### Global Generation Guidance
+      - **Global Navigation Cognitive Anchor**: {global_tokens}
+      
+      ### Natural Language Intent
+      {nl_description}
+      
+      ### java Source Code
+      ```java
+      {java_code} 
+      ```
+      ### Task
+      Translate the provided Java source code into a syntax-valid, production-ready Racket implementation:

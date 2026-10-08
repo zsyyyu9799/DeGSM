@@ -1,0 +1,97 @@
+language: "Cpp"
+tgt_language: "Ocaml"
+task: "translation"
+
+output:
+  save_dir: "/root/autodl-tmp/first_paper/output/cpp/third_stage/Ocaml_inference_results"
+  # 新增：推理结果具体保存的 CSV 路径
+  inference_csv: "/root/autodl-tmp/first_paper/cpp/translation_dataset/Ocaml_inference_results_original.csv"
+  log_freq: 10
+  multilang_evaluation_report: "/root/autodl-tmp/first_paper/human_stage3_llm/deepseek_evaluation_reports/human_cpp_to_ocaml_evaluation.csv" #最后评估生成的数据human或mbpp
+
+data:
+  # 统一输入路径
+  test_path: "/root/autodl-tmp/first_paper/cpp/translation_dataset/nl_code_stage3_cleaned.jsonl" #第一次评估用这个
+  batch_size: 1
+  num_workers: 2
+  test_path: "/root/autodl-tmp/first_paper/human_stage3_llm/cpp/ocaml/new_human_cpp_vs_ocaml.jsonl" #最后的评估用这个数据
+  
+traindata:
+  batch_size: 4
+  num_workers: 2
+
+trainer:
+  lr: 2e-5              # 💡 将基准学习率从 5e-5 压低到 2e-5（步子迈小点）
+  weight_decay: 0.05    # 💡 确保该参数存在，并传递给 AdamW
+  num_epochs: 100
+
+finetune:
+  lr: 0.000005
+  weight_decay: 0.05
+  num_epochs: 200
+  batch_size: 2
+  num_workers: 2
+  finetune_model: "/root/autodl-tmp/first_paper/output/cpp/third_stage/Ocaml_inference_results/finetune_deepseek_model.pt"
+
+model:
+  embed_dim: 256
+  graph_width: 768
+  bert_model_dir: "microsoft/graphcodebert-base"
+  stage3_model_dir: "/root/autodl-tmp/first_paper/output/cpp/third_stage/Ocaml_inference_results/best_stage3_model.pt"
+  stage2_model_dir: "/root/autodl-tmp/first_paper/output/cpp/second_stage/best_innovative_model.pt"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/starcoder"
+  llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/deepseek"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/qwen"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/llamabase"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/llama"
+  llm_type: "deepseek"
+  llm_dtype: "bfloat16"
+  max_txt_len: 1024
+  num_query_token: 32
+  query_groups: [10, 10, 10, 2]
+
+  use_api_mode: False
+
+generation:
+  max_new_tokens: 1024  # 保持不变，确保长函数不会被截断
+  min_new_tokens: 50
+  temperature: 0.9      # 初始生成保持低温度（更稳定）
+  top_p: 0.95
+  repetition_penalty: 1.05 # 适中的惩罚，防止模型陷入死循环
+  use_graph_info: True  # 确保图增强模式开启  False
+
+  # 新增/建议明确的参数
+  do_sample: True       # 必须为 True，否则修复时的随机性不足
+  num_candidates: 5 #生成的候选
+
+prompts:
+  translation:
+    # 系统提示词：面向 Ocaml 语言特性进行特化重写
+    system_prompt: |
+      You are an elite compiler engineer. Translate the given C++ code into idiomatic, high-performance, and syntax-valid Ocaml code.
+      Guidelines:
+      1. Paradigm Shift: Map loops/mutable states to pure functions, pattern matching, and tail-recursion (`let rec`). Do NOT use `ref`/arrays unless critical.
+      2. Type Alignment: Map STL containers (`vector`, `map`) to native Ocaml `list`/`Map`. Use ADTs/records for structure layout safety.
+      3. Safety: Translate pointers, exceptions, and error returns into Ocaml `option` (`Some`/`None`) or `result` (`Ok`/`Error`). Eliminate `nullptr`.
+      4. Output Only: Return ONLY executable Ocaml code inside ```ocaml ... ``` blocks. No text explanations, macros, or `failwith` placeholders.
+
+    user_prompt: |
+      ### Cross-Modal Representation Analysis
+      The following graph-based features have been extracted from the cpp source code:
+      - **Structural Topology (AST)**: {struct_tokens}
+      - **Logical Control Flow (CFG)**: {logic_tokens}
+      - **Semantic Context**: {semantic_tokens}
+      
+      ### Global Synthesis Guidance
+      - **Global Navigation Anchor**: {global_tokens}
+      
+      ### Natural Language Intent
+      {nl_description}
+      
+      ### cpp Source Code
+      ```cpp
+      {cpp_code} 
+      ```
+      
+      ### Task
+      Please translate the provided C++ code into a production-ready, syntax-valid Ocaml implementation based on the structural, logical, and semantic features analyzed above:

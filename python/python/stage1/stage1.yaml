@@ -1,0 +1,58 @@
+# CGBridge Stage 1: CGE (Code Graph Encoder) Pre-training
+# 目标：通过自监督学习（对比学习 + 掩码重构）获取代码的“逻辑指纹”
+
+output:
+  # 训练结果与 Checkpoints 存放路径
+  save_dir: "/root/autodl-tmp/first_paper/output/python/first_stage"
+
+data:
+  train_path: "/root/autodl-tmp/first_paper/graph_dataset/python/train_graphs.pt"
+  valid_path: "/root/autodl-tmp/first_paper/graph_dataset/python/val_graphs.pt"
+  metadata_path: "/root/autodl-tmp/first_paper/python/graph_metadata.pt"
+
+# 模型架构参数
+model:
+  in_channels: 768            # 输入节点特征维度 (UniXcoder 原始 Embedding)
+  hidden_channels: 512        # GNN 隐藏层维度
+  out_channels: 256           # 最终输出的图指纹 (Graph Embedding) 维度
+  gnn_type: "gat"              # 推荐使用 'gat' 或 'gt' 以捕获异构注意力权重
+  num_layers: 4               # GNN 层数，建议 3-5 层以覆盖长距离依赖
+  dropout: 0.1                # 防止过拟合的随机失活率
+  num_heads: 8                # 多头注意力机制的头数
+
+  # 异构边映射定义
+  edge_type_map:
+    0: "AST"
+    1: "CFG"
+    2: "DFG"
+
+# 训练与预训练任务配置
+trainer:
+  # 基础训练参数
+  batch_size: 32
+  lr: 0.00005
+  weight_decay: 0.01
+  num_epochs: 100
+  patience: 10                # 早停容忍轮数
+  monitor: "loss"             # 监控总损失 (Contrastive + Recon)
+  mode: "min"
+
+  # --- 自监督任务权重分配 ---
+
+  # 1. 节点掩码重构 (Node Feature Reconstruction)
+  lambda_recon: 1.0
+  # 2. 针对性加强语义遮蔽，防止模型走捷径
+  mask_prob_struct: 0.4   # 遮蔽控制流
+  mask_prob_logic: 0.4    # 遮蔽逻辑运算符
+  mask_prob_semantic: 0.3 # 遮蔽变量名（重点强化）
+
+
+  # 2. 图级对比学习 (Contrastive Learning - InfoNCE)
+  lambda_cl: 0.7
+  cl_temperature: 0.2       
+  node_drop_prob: 0.3         # 掉落 10% 的节点（清零其特征）
+  edge_dropout: 0.3          # 丢弃 20% 的边
+
+  # 3. 辅助任务：边类型预测
+  lambda_edge: 0.6            # 边类型预测损失权重
+  neg_samples_ratio: 0.5      #d 负采样比例

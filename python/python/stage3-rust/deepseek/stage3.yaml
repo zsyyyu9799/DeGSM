@@ -1,0 +1,95 @@
+# CGBridge Stage 3: 推理配置 (C to Rust 代码生成)
+language: "Python"
+tgt_language: "Rust"
+task: "translation"
+
+output:
+  save_dir: "/root/autodl-tmp/first_paper/output/python/third_stage/Rust_inference_results"
+  # 新增：推理结果具体保存的 CSV 路径
+  inference_csv: "/root/autodl-tmp/first_paper/python/translation_dataset/Rust_inference_results_original.csv"
+  log_freq: 10
+  multilang_evaluation_report: "/root/autodl-tmp/first_paper/human_stage3_llm/deepseek_evaluation_reports/mbpp_py_to_rust_evaluation.csv" #最后评估生成的数据human或mbpp
+
+data:
+  # 统一输入路径
+  # test_path: "/root/autodl-tmp/first_paper/python/translation_dataset/nl_code_stage3_compiled_clean.jsonl" #第一次推理用这个
+  batch_size: 1
+  num_workers: 2
+  test_path: "/root/autodl-tmp/first_paper/human_stage3_llm/python/rust/new_mbpp_python_vs_rust.jsonl" #最后的评估用这个数据
+  
+traindata:
+  batch_size: 3
+  num_workers: 2
+
+trainer:
+  lr: 2e-5              # 💡 将基准学习率从 5e-5 压低到 2e-5（步子迈小点）
+  weight_decay: 0.05    # 💡 确保该参数存在，并传递给 AdamW
+  num_epochs: 100
+
+finetune:
+  lr: 0.00002
+  weight_decay: 0.05
+  num_epochs: 200
+  batch_size: 3
+  num_workers: 2
+  finetune_model: "/root/autodl-tmp/first_paper/output/python/third_stage/Rust_inference_results/finetune_deepseek_model.pt"
+
+model:
+  embed_dim: 256
+  graph_width: 768
+  use_api_mode: False
+  bert_model_dir: "microsoft/graphcodebert-base"
+  stage3_model_dir: "/root/autodl-tmp/first_paper/output/python/third_stage/Rust_inference_results/best_stage3_model.pt"
+  stage2_model_dir: "/root/autodl-tmp/first_paper/output/python/second_stage/best_innovative_model.pt"
+  # llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/Qwen2.5"
+  llm_name_or_path: "/root/autodl-tmp/first_paper/LLM/Deepseek"
+  llm_type: "deepseek"
+  llm_dtype: "bfloat16"
+  max_txt_len: 1024
+  num_query_token: 32
+  query_groups: [10, 10, 10, 2]
+
+generation:
+  max_new_tokens: 1024  # 保持不变，确保长函数不会被截断
+  min_new_tokens: 50
+  temperature: 0.9      # 初始生成保持低温度（更稳定）
+  top_p: 0.95
+  repetition_penalty: 1.05 # 适中的惩罚，防止模型陷入死循环
+  use_graph_info: True  # 确保图增强模式开启  False
+
+  # 新增/建议明确的参数
+  do_sample: True       # 必须为 True，否则修复时的随机性不足
+  num_candidates: 5 #生成的候选
+
+prompts:
+  translation:
+    # 系统提示词：定义模型角色，并明确图特征（Graph Embedding）的主导地位
+    system_prompt: |
+      You are an expert Rust software engineer specializing in rewriting Python code into high-performance, memory-safe Rust.
+      
+      Translation Guidelines:
+      1. **Memory Management**: Convert Python's garbage-collected logic into Rust's ownership model. Use smart pointers (Arc, Mutex, Box) only when necessary for shared state.
+      2. **Type Mapping**: Map Python's dynamic types (int, list, dict) to Rust's static types (i64, Vec<T>, HashMap<K,V>) with precision.
+      3. **Error Handling**: Replace Python's try-except blocks with Rust's idiomatic Result<T, E> or Option<T> patterns.
+      4. **Safety**: Ensure code adheres to Rust's safety standards. Use `unsafe` blocks only for direct pointer manipulations or FFI if required.
+      
+    user_prompt: |
+      ### Cross-Modal Representation Analysis
+      The multi-dimensional graph features extracted from the Python source code are as follows:
+      - **Structural Topology Information (AST)**: {struct_tokens}
+      - **Logical Control Flow Information (CFG)**: {logic_tokens}
+      - **Code Semantic Context Features**: {semantic_tokens}
+
+      ### Global Generation Guidance
+      - **Global Navigation Cognitive Anchor**: {global_tokens}
+      
+      ### Natural Language Intent
+      {nl_description}
+      
+      ### Python Source Code
+      ```python
+      {python_code} 
+      ```
+      
+      ### Task
+      Please translate the provided Python code into a production-ready, compilable Rust implementation based on the analysis above:
